@@ -29,6 +29,10 @@ GAP_PARA = 1.1       # giữa các đoạn
 GAP_SECTION = 2.2    # giữa các phần (nhạc nổi lên)
 OUTRO = 8.0          # nhạc kết
 
+# Giọng đọc
+PITCH_UP = 1.5       # nửa cung, nâng tông cho trẻ trung
+PACE = 1.12          # >1 = chậm hơn tốc độ gốc của mô hình
+
 FONT_B = "/usr/share/fonts/opentype/inter/Inter-Bold.otf"
 FONT_XB = "/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf"
 FONT_SB = "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf"
@@ -67,18 +71,29 @@ def parse_script(path):
 def synth_all(items):
     from piper import PiperVoice, SynthesisConfig
     voice = PiperVoice.load(VOICE)
-    cfg = SynthesisConfig(length_scale=1.2, noise_scale=0.6, noise_w_scale=0.75)
+    # Giọng trẻ trung: nâng tông PITCH_UP nửa cung bằng cách đọc chậm hơn rồi phát nhanh lại
+    # (tông và âm sắc cùng sáng lên, tốc độ cuối cùng giữ ≈ PACE).
+    r = 2 ** (PITCH_UP / 12)
     vsr = voice.config.sample_rate
     for it in items:
         if it["kind"] != "line":
             continue
-        chunks = list(voice.synthesize(it["spoken"], syn_config=cfg))
-        audio = np.concatenate([c.audio_float_array for c in chunks])
+        text = it["spoken"]
+        pace = PACE * (0.94 if text.endswith("!") else 1.0)  # câu cảm thán đọc tươi hơn
+        cfg = SynthesisConfig(length_scale=pace * r, noise_scale=0.78, noise_w_scale=0.9)
+        chunks = list(voice.synthesize(text, syn_config=cfg))
+        pause = np.zeros(int(0.28 * vsr * r), dtype=np.float32)
+        parts = []
+        for c in chunks:
+            x = c.audio_float_array
+            nz = np.where(np.abs(x) > 0.01)[0]
+            parts += [x[max(0, nz[0] - 200): nz[-1] + 600] if len(nz) else x, pause]
+        audio = np.concatenate(parts[:-1])
         # cắt khoảng lặng hai đầu
         idx = np.where(np.abs(audio) > 0.01)[0]
         audio = audio[max(0, idx[0] - 200): idx[-1] + 600] if len(idx) else audio
-        # nâng lên 44.1 kHz
-        n = int(len(audio) * SR / vsr)
+        # nâng tông + chuyển lên 44.1 kHz
+        n = int(len(audio) * SR / (vsr * r))
         audio = np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio)
         it["audio"] = audio.astype(np.float32)
         print(f"  tts {len(audio)/SR:5.1f}s  {it['spoken'][:60]}", flush=True)
@@ -395,6 +410,16 @@ def main():
             i = int(it["start"] * SR)
             a = it["audio"] / max(1e-6, np.abs(it["audio"]).max()) * 0.9
             voice[i:i + len(a)] += a[: n - i]
+    # màu giọng: lọc ù, tăng độ sáng/trong, thêm chút vang phòng thu
+    vraw = os.path.join(BUILD, "voice_raw.wav")
+    vfx = os.path.join(BUILD, "voice_fx.wav")
+    sf.write(vraw, voice, SR)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", vraw, "-af",
+                    "highpass=f=110,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3200:t=q:w=1.2:g=3,"
+                    "equalizer=f=9000:t=q:w=1:g=2,acompressor=threshold=-18dB:ratio=3:attack=5:release=80,"
+                    "aecho=0.85:0.6:35|60:0.10|0.06", "-ar", str(SR), vfx], check=True)
+    voice = sf.read(vfx, dtype="float32")[0][:n]
+    voice = np.pad(voice, (0, n - len(voice)))
     music = make_music(total) * music_envelope(items, total)
     mix = voice + music.astype(np.float32)
     mix /= np.abs(mix).max() / 0.95
